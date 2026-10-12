@@ -89,7 +89,7 @@ export function Canopy({ status, pond, offline }: { status: Status | null; pond:
       now.set(n.dataset.key!, b);
       const a = last.current.get(n.dataset.key!);
       if (!a || a.w !== b.w || prefersReducedMotion() || (Math.abs(a.x - b.x) < 2 && Math.abs(a.y - b.y) < 2)) return;
-      gsap.fromTo(n, { x: a.x - b.x, y: a.y - b.y }, { x: 0, y: 0, duration: 1.6, ease: "power2.inOut" });
+      gsap.fromTo(n, { x: a.x - b.x, y: a.y - b.y }, { x: 0, y: 0, duration: 1.6, ease: "power2.inOut", clearProps: "transform" });
     });
     last.current = now;
   });
@@ -127,7 +127,9 @@ export function Canopy({ status, pond, offline }: { status: Status | null; pond:
   useGSAP(
     () => {
       if (prefersReducedMotion() || !rows.length) return;
-      gsap.from(".hang .hanger", { y: -46, opacity: 0, duration: 0.7, ease: "bounce.out", stagger: 0.07, delay: 0.7 });
+      // Each sloth drops onto the bough together with its label. On first load they wait for the boughs to
+      // grow; when the live board arrives later, the boughs are already there and they come at once.
+      gsap.from(".hang > button", { y: -46, opacity: 0, duration: 0.6, ease: "bounce.out", stagger: 0.05, delay: performance.now() < 1400 ? 0.7 : 0.05 });
     },
     { scope: wrap, dependencies: [rows.length > 0] },
   );

@@ -61,7 +61,7 @@ export function Register({ status, pond }: { status: Status | null; pond: Pond |
         const a = last.current.get(n.dataset.key!);
         const b = now.get(n.dataset.key!);
         if (!a || !b || a.w !== b.w || (Math.abs(a.x - b.x) < 2 && Math.abs(a.y - b.y) < 2)) return;
-        gsap.fromTo(n, { x: a.x - b.x, y: a.y - b.y, zIndex: 3 }, { x: 0, y: 0, duration: 1.1, ease: "power2.inOut", clearProps: "zIndex" });
+        gsap.fromTo(n, { x: a.x - b.x, y: a.y - b.y, zIndex: 3 }, { x: 0, y: 0, duration: 1.1, ease: "power2.inOut", clearProps: "transform,zIndex" });
       });
     last.current = now;
     const k = rows[0]?.addr;
