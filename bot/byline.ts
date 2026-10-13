@@ -1,5 +1,5 @@
 /**
- * Bylines: holders sign a plain message to put their own gangster nickname on the
+ * Bylines: holders sign a plain message to put their own nickname and skull on the
  * leaderboard. No transaction, no gas. Kept in its own file so a token change never
  * wipes them; the claim, split and burn logic never reads this module.
  */
@@ -7,6 +7,7 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { ethers } from "ethers";
+import { NAME, TICKER } from "./brand";
 
 const FILE = path.resolve(process.cwd(), "bot-bylines.json");
 
@@ -26,11 +27,11 @@ interface Byline {
   at?: number;
   /** While set, the leaderboard shows the X account instead of the nickname and mugshot. */
   x?: XProfile;
-  /** Mugshot parts [fur, hat, accessory, background]; absent means the generated one. */
+  /** Skull parts [bone, horns, sockets, background]; absent means the generated one. */
   pp?: number[];
 }
 
-/** Part counts per slot. Must match PARTS in src/components/Mugshot.tsx. */
+/** Part counts per slot. Must match PARTS in src/skull/Skull.tsx. */
 export const MUGSHOT_PARTS = [5, 5, 6, 6];
 
 const book: Record<string, Byline> = (() => {
@@ -54,7 +55,7 @@ const nonces = new Map<string, { nonce: string; exp: number }>();
 
 /** Words a byline may not contain: impersonation of staff, and the obvious abuse. */
 const BANNED = [
-  "admin", "official", "hangon", "hang on", "bank", "support", "moderator", "team", "staff", "dev", "owner", "pons", "airdrop", "claim", "giveaway",
+  "admin", "official", "bank", "support", "moderator", "team", "staff", "dev", "owner", "pons", "airdrop", "claim", "giveaway",
   "fuck", "shit", "cunt", "nigg", "fag", "rape", "nazi", "hitler", "porn", "whore", "bitch", "retard",
 ];
 
@@ -90,7 +91,7 @@ export function clearX(addr: string) {
 /** The text a wallet signs to link or unlink X. */
 export function xMessage(addr: string, action: "link" | "unlink", nonce: string) {
   return [
-    `Hang On: ${action} my X account`,
+    `${NAME}: ${action} my X account`,
     `Wallet: ${ethers.getAddress(addr)}`,
     `Nonce: ${nonce}`,
     "This signature is free and moves no funds.",
@@ -104,10 +105,10 @@ function validMugshot(pp: unknown): pp is number[] {
 /** The exact text the wallet signs. The server rebuilds it, so the client cannot change a word. */
 export function bylineMessage(addr: string, name: string, pp: string, nonce: string) {
   return [
-    "Hang On: set my name and sloth",
+    `${NAME}: set my name and skull`,
     `Wallet: ${ethers.getAddress(addr)}`,
     `Nickname: ${name}`,
-    `Sloth: ${pp}`,
+    `Skull: ${pp}`,
     `Nonce: ${nonce}`,
     "This signature is free and moves no funds.",
   ].join("\n");
@@ -163,12 +164,12 @@ export function claimByline(input: { addr?: unknown; name?: unknown; pp?: unknow
   const addr = input.addr.toLowerCase();
   const { name, error } = cleanName(input.name);
   if (error || !name) return { error };
-  if (!validMugshot(input.pp)) return { error: "Pick a mugshot." };
+  if (!validMugshot(input.pp)) return { error: "Pick a skull." };
   const pp = input.pp;
   const bad = spendNonce(addr, input.nonce, input.signature, (n) => bylineMessage(addr, name, pp.join("-"), n));
   if (bad) return { error: bad };
   const now = Math.floor(Date.now() / 1000);
-  if (!isHolder(addr)) return { error: "Only wallets holding $HANG can claim a name." };
+  if (!isHolder(addr)) return { error: `Only wallets holding ${TICKER} can claim a name.` };
   const prev = book[addr];
   if (prev?.x) return { error: "This wallet shows its X account. Unlink X first to use a nickname." };
   const changed = !prev || prev.name !== name || (prev.pp ?? []).join("-") !== pp.join("-");

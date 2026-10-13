@@ -1,13 +1,16 @@
 /**
- * Hang On ($HANG) engine · Robinhood Chain (4663) · Pons Family v2
+ * Urn ($URN) engine · Robinhood Chain (4663) · Pons Family v2
  *
- * 1. Indexer: follows every $HANG Transfer, keeps balances and first-buy time, and marks a
- *    wallet "out" forever once it sends $HANG to the curve / a DEX contract.
+ * 1. Indexer: follows every token Transfer, keeps balances, first-buy time and what each wallet
+ *    bought since the last feeding, and marks a wallet "out" forever once it sends the token to
+ *    the curve / a DEX contract.
  * 2. The cycle. Each time the Pons fee escrow reaches the step's size, the engine claims it
  *    and spends all of it on that step, then moves to the next:
- *      feeding  (0.02 ETH)  → ETH straight to the 10 biggest holders on the branches, split by tier and balance
- *      keeper   (0.025 ETH) → the treasury
- *    then back to feeding. There is no buyback and no burn: the engine never buys or destroys $HANG.
+ *      feeding  (0.02 ETH) → ETH to holders: the spark (the biggest buyer since the last feeding)
+ *                            takes its cut, the rest goes to the 10 biggest holders by tier and balance
+ *      burn     (0.02 ETH) → buys the token and sends what it bought to the dead address
+ *      keeper   (0.01 ETH) → the treasury
+ *    then back to feeding. The burn is the only time the engine buys; it never sells.
  * Every transaction hash is saved before it is awaited, so a restart checks the chain and
  * resumes the round instead of sending twice.
  */
@@ -16,7 +19,8 @@ import http from "http";
 import path from "path";
 import { ethers } from "ethers";
 import { config, saveConfig, state, saveStateNow, saveStateSoon, resetStateForToken, logs, log, CYCLE, type Holder, type Payout, type Round, type RoundKind } from "./store";
-import { UNISWAP_V4_UNIVERSAL_ROUTER } from "./uniswap-v4";
+import { UNISWAP_V4_UNIVERSAL_ROUTER, buildUniswapV4Buy } from "./uniswap-v4";
+import { TICKER } from "./brand";
 import { bylineOf, bylineMessage, claimByline, clearX, issueNonce, mugshotOf, rateLimited, removeByline, setX, spendNonce, xMessage, xOf } from "./byline";
 import { backTo, finishLink, parkDemoResult, startLink, takeDemoResult, xDemoEnabled, xEnabled } from "./xlink";
 
@@ -27,20 +31,23 @@ const TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
 const GAS_BUFFER = ethers.parseEther("0.0008");
 
 const ESCROW_ABI = ["function balanceOf(address) view returns (uint256)", "function claim()"];
-// Only ever called as a static quote for the display price; the engine never sends a buy.
+// Quoted statically for the display price and before a burn; sent only by the burn step.
 const CURVE_ABI = ["function buy(uint256 quoteIn, uint256 minTokensOut, address recipient) payable returns (uint256)"];
 const ERC20_ABI = [
   "function balanceOf(address) view returns (uint256)",
   "function transfer(address to, uint256 amount) returns (bool)",
   "function decimals() view returns (uint8)",
+  "function totalSupply() view returns (uint256)",
   "function curve() view returns (address)",
 ];
 
 let provider: ethers.JsonRpcProvider | null = null;
 let wallet: ethers.Wallet | null = null;
-let status: "standby" | "indexing" | "claiming" | "feeding" | "keeper" | "idle" | "error" = "standby";
+let status: "standby" | "indexing" | "claiming" | "feeding" | "burn" | "keeper" | "idle" | "error" = "standby";
 let escrowWei = 0n;
 let decimals = 18;
+// Pons mints the whole supply once, so this is read once per token. Burned tokens sit at the dead address.
+let supplyRaw = 0n;
 
 const lc = (a: string) => a.toLowerCase();
 const isAddr = (a?: string) => !!a && ethers.isAddress(a.trim());
@@ -62,6 +69,37 @@ function initWallet() {
   }
 }
 initWallet();
+
+/* ───────────────────────── the pool ───────────────────────── */
+
+let poolKnown = false;
+let poolAsked = 0;
+
+/**
+ * After graduation the token trades in the chain's one Uniswap v4 PoolManager, which then holds a
+ * large balance of it. Left unknown it would be ranked as a holder, sent rewards, and win the
+ * spark in the round it was funded. The router knows the manager's address, so the engine asks it
+ * and keeps the answer in the sell sinks: never ranked or paid, sells into it are sells, buys out
+ * of it are buys. Asked again every ten minutes until it answers.
+ */
+async function learnPool() {
+  const now = Math.floor(Date.now() / 1000);
+  if (poolKnown || now - poolAsked < 600) return;
+  poolAsked = now;
+  try {
+    const router = new ethers.Contract(UNISWAP_V4_UNIVERSAL_ROUTER, ["function poolManager() view returns (address)"], provider!);
+    const pm: string = await router.poolManager();
+    if (!isAddr(pm) || pm === ethers.ZeroAddress || (await provider!.getCode(pm)) === "0x") throw new Error("the router gave no contract address");
+    poolKnown = true;
+    if (!config.sellSinks.map(lc).includes(lc(pm))) {
+      config.sellSinks.push(pm);
+      saveConfig();
+      log("info", `Pool manager learnt from the router: ${pm}. Added to the sell sinks.`);
+    }
+  } catch (e: any) {
+    log("warn", `Couldn't read the pool manager from the router (${errText(e)}). Until it is known, set the pool's address in SELL_SINKS by hand.`);
+  }
+}
 
 /* ───────────────────────── eligibility ───────────────────────── */
 
@@ -103,7 +141,22 @@ function sittersByBalance(now: number) {
     .sort((a, b) => (big(b.h.balance) > big(a.h.balance) ? 1 : big(b.h.balance) < big(a.h.balance) ? -1 : a.h.firstIn - b.h.firstIn));
 }
 
-const stepETH = (k: RoundKind) => (k === "feeding" ? config.feedingETH : config.keeperETH);
+const stepETH = (k: RoundKind) => (k === "feeding" ? config.feedingETH : k === "burn" ? config.burnETH : config.keeperETH);
+
+/** The spark: the wallet that bought the most since the last feeding and has not moved it on. */
+function sparkLeader(now: number, ex = excluded()) {
+  if (!(config.sparkPct > 0)) return null;
+  let best: { addr: string; h: Holder; bought: bigint } | null = null;
+  for (const [addr, h] of Object.entries(state.holders)) {
+    const bought = big(h.bought || "0");
+    if (bought === 0n) continue;
+    const s = standing(addr, h, now, ex);
+    // a buyer need not have aged yet: buying this round is the whole point
+    if (s !== "sitting" && s !== "waiting") continue;
+    if (!best || bought > best.bought || (bought === best.bought && h.firstIn < best.h.firstIn)) best = { addr, h, bought };
+  }
+  return best;
+}
 const currentKind = () => CYCLE[state.cycle % CYCLE.length];
 
 /* ───────────────────────── indexer ───────────────────────── */
@@ -191,12 +244,20 @@ async function indexTransfers() {
           h.hoppedTx = l.transactionHash;
           log("info", `hopped off: ${src.slice(0, 8)}… (tx ${l.transactionHash.slice(0, 10)}…)`);
         }
+        // What a wallet sends on no longer counts as bought this round.
+        if (h.bought) h.bought = big(h.bought) > value ? (big(h.bought) - value).toString() : "0";
       }
       if (dst !== ZERO) {
+        // A buy comes straight from the curve or pool, or through a router that got it there in this same tx.
+        // A transfer from any other wallet or contract is not one, so tokens can't be cycled into a "buy".
+        const from = state.holders[src];
+        const isBuy = sinks.has(src) || (!!from?.relay && from.lastInTx === l.transactionHash && !!from.lastInBuy);
         const h = (state.holders[dst] ||= { balance: "0", firstIn: 0, hopped: false, hoppedAt: 0, hoppedTx: "", received: "0" });
         if (big(h.balance) === 0n && !h.firstIn) h.firstIn = t;
         h.balance = (big(h.balance) + value).toString();
         h.lastInTx = l.transactionHash;
+        h.lastInBuy = isBuy;
+        if (isBuy && !ex.has(dst)) h.bought = add(h.bought || "0", value);
       }
     }
     state.lastIndexedBlock = to;
@@ -219,15 +280,37 @@ async function txState(hash: string): Promise<"ok" | "reverted" | "lost"> {
  * Sends a transaction for one slot of a round. The hash is saved before waiting, so after a
  * restart an existing hash is checked on-chain and only re-sent if it reverted or never landed.
  */
-async function once(get: () => string, set: (h: string) => void, send: () => Promise<ethers.TransactionResponse>) {
+/** Nothing is wrong, but the round can't move yet. Said once in the log, then tried again next tick. */
+class Waiting extends Error {}
+
+/**
+ * Sends a transaction for one slot of a round. The hash and the nonce are saved before waiting, so
+ * after a restart an existing hash is checked on-chain first.
+ * A reverted one is sent again as a new transaction. One the node no longer knows is the dangerous
+ * case, because it may still land: if its nonce has been used since, it is taken to be mined and
+ * the round waits for the node to show it; if not, it is sent again with the same nonce, so at most
+ * one of the two can ever be included. Either way the same payment is never made twice.
+ */
+async function once(get: () => string, set: (h: string) => void, send: (o: { nonce?: number }) => Promise<ethers.TransactionResponse>) {
   const prev = get();
+  let slot: number | undefined;
   if (prev) {
-    if ((await txState(prev)) === "ok") return true;
-    set("");
-    saveStateNow();
+    const was = await txState(prev);
+    if (was === "ok") return true;
+    const nonce = state.nonces?.[prev];
+    if (was === "lost" && nonce !== undefined) {
+      const used = await provider!.getTransactionCount(wallet!.address, "latest");
+      if (used > nonce) throw new Waiting(`Transaction ${prev} can't be found, but its nonce (${nonce}) has been used. Waiting for the node to show it rather than sending it twice.`);
+      slot = nonce;
+    }
   }
-  const tx = await send();
+  // The old hash stays in place until the new one exists: if this send fails, the next tick looks at the old one again.
+  const tx = await send(slot === undefined ? {} : { nonce: slot });
   set(tx.hash);
+  const nonces = (state.nonces ||= {});
+  nonces[tx.hash] = tx.nonce;
+  const kept = Object.keys(nonces);
+  for (const h of kept.slice(0, Math.max(0, kept.length - 300))) delete nonces[h];
   saveStateNow();
   const r = await tx.wait();
   return r?.status === 1;
@@ -248,6 +331,10 @@ async function startRound() {
   if (escrowWei === 0n || escrowWei < ethers.parseEther(stepETH(kind))) return;
   if (kind === "feeding" && sittersByBalance(Math.floor(Date.now() / 1000)).length === 0) {
     note("Feeding is due but no wallet is seated yet. The fees wait in the escrow.");
+    return;
+  }
+  if (kind === "burn" && !(await canBuy())) {
+    note(`Burn is due but the engine can't buy ${TICKER} right now (no curve quote and no pool route). The fees wait in the escrow.`);
     return;
   }
   if (kind === "keeper" && !isAddr(config.treasuryAddress)) {
@@ -287,13 +374,14 @@ function countPayout(p: Payout) {
   if (p.counted) return;
   const h = state.holders[p.addr];
   if (h) h.received = add(h.received, big(p.amount));
-  state.totals.fedWei = add(state.totals.fedWei, big(p.amount));
+  if (p.spark) state.totals.sparkWei = add(state.totals.sparkWei, big(p.amount));
+  else state.totals.fedWei = add(state.totals.fedWei, big(p.amount));
   p.counted = true;
 }
 
 async function claimRound(r: Round) {
   const escrow = new ethers.Contract(PONS_FEE_ESCROW, ESCROW_ABI, wallet!);
-  const ok = await once(() => r.claimTx, (h) => (r.claimTx = h), () => escrow.claim());
+  const ok = await once(() => r.claimTx, (h) => (r.claimTx = h), (o) => escrow.claim(o));
   if (!ok) {
     r.stage = "failed";
     saveStateNow();
@@ -314,20 +402,23 @@ async function claimRound(r: Round) {
 async function feed(r: Round) {
   status = "feeding";
   if (!r.payouts.length) {
-    const top = sittersByBalance(Math.floor(Date.now() / 1000)).slice(0, config.feedingTopN);
-    if (!top.length) return note(`Round #${r.n}: nobody seated right now. Holding the ETH until someone is.`);
     const pay = big(r.payWei);
-    const split = splitFeeding(pay, top.map((s) => big(s.h.balance)));
+    const { top, split, spark, sparkPay } = planFeeding(pay, Math.floor(Date.now() / 1000));
+    if (!top.length) return note(`Round #${r.n}: nobody seated right now. Holding the ETH until someone is.`);
     r.snapshotBlock = state.lastIndexedBlock;
     r.payouts = top.map((s, i) => ({ addr: s.addr, balance: s.h.balance, amount: split[i].toString(), tx: "" })).filter((p) => big(p.amount) > 0n);
+    const ten = r.payouts.length;
+    if (spark && sparkPay > 0n) r.payouts.push({ addr: spark.addr, balance: spark.bought.toString(), amount: sparkPay.toString(), tx: "", spark: true });
+    // the next round of buying starts from this snapshot
+    for (const h of Object.values(state.holders)) delete h.bought;
     saveStateNow();
-    log("info", `Feeding #${r.n}: ${ethers.formatEther(pay)} ETH to the top ${r.payouts.length} sitters.`);
+    log("info", `Feeding #${r.n}: ${ethers.formatEther(pay)} ETH to the top ${ten} sitters${spark && sparkPay > 0n ? `, ${ethers.formatEther(sparkPay)} of it to the spark ${spark.addr.slice(0, 8)}…` : ""}.`);
   }
   for (const p of r.payouts) {
     if (p.skipped || p.counted) continue;
     let sent = false;
     try {
-      sent = await once(() => p.tx, (h) => (p.tx = h), () => wallet!.sendTransaction({ to: p.addr, value: big(p.amount) }));
+      sent = await once(() => p.tx, (h) => (p.tx = h), (o) => wallet!.sendTransaction({ to: p.addr, value: big(p.amount), ...o }));
     } catch (e: any) {
       // Only a recipient that refuses ETH (a contract) is skipped; RPC trouble is retried next tick.
       if (e?.code !== "CALL_EXCEPTION") throw e;
@@ -343,10 +434,81 @@ async function feed(r: Round) {
   return true;
 }
 
+/** Tokens the curve gives for `wei` right now; null once the curve no longer sells (graduated) or can't be read. */
+async function curveQuote(wei: bigint): Promise<bigint | null> {
+  if (!isAddr(config.curveAddress)) return null;
+  const curve = new ethers.Contract(config.curveAddress, CURVE_ABI, provider!);
+  try {
+    const out: bigint = await curve.buy.staticCall(wei, 0n, wallet!.address, { value: wei, from: wallet!.address });
+    return out > 0n ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Whether a buy would go through at all, tried with a sliver the gas buffer covers. Asked before a burn claims the escrow. */
+async function canBuy() {
+  const probe = ethers.parseEther("0.0001");
+  if ((await curveQuote(probe)) !== null) return true;
+  try {
+    await provider!.call({ from: wallet!.address, to: UNISWAP_V4_UNIVERSAL_ROUTER, data: buildUniswapV4Buy(config.tokenAddress, probe), value: probe });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The tokens a confirmed buy delivered to the engine wallet, read from its Transfer logs. */
+async function tokensIn(hash: string) {
+  const receipt = await provider!.getTransactionReceipt(hash);
+  const me = ethers.zeroPadValue(wallet!.address, 32).toLowerCase();
+  let sum = 0n;
+  for (const l of receipt?.logs ?? []) {
+    if (lc(l.address) === lc(config.tokenAddress) && l.topics[0] === TRANSFER_TOPIC && l.topics[2]?.toLowerCase() === me) sum += BigInt(l.data);
+  }
+  return sum;
+}
+
+/** Buys the token with the whole step, then sends exactly what that buy brought in to the dead address. */
+async function burn(r: Round) {
+  status = "burn";
+  const pay = big(r.payWei);
+  if (big(r.burnedRaw || "0") === 0n) {
+    const bought = await once(
+      () => r.buyTx || "",
+      (h) => (r.buyTx = h),
+      async (o) => {
+        const quote = await curveQuote(pay);
+        if (quote !== null) {
+          const curve = new ethers.Contract(config.curveAddress, CURVE_ABI, wallet!);
+          return curve.buy(pay, (quote * BigInt(100 - config.burnSlippagePct)) / 100n, wallet!.address, { value: pay, ...o });
+        }
+        // Off the curve: the pool, through the Universal Router. The template carries no minimum out.
+        return wallet!.sendTransaction({ to: UNISWAP_V4_UNIVERSAL_ROUTER, data: buildUniswapV4Buy(config.tokenAddress, pay), value: pay, ...o });
+      },
+    );
+    if (!bought) throw new Error(`Round #${r.n}: the burn buy reverted`);
+    const got = await tokensIn(r.buyTx!);
+    if (got === 0n) throw new Error(`Round #${r.n}: the burn buy ${r.buyTx} brought in no ${TICKER}`);
+    r.burnedRaw = got.toString();
+    saveStateNow();
+  }
+  const amount = big(r.burnedRaw!);
+  const token = new ethers.Contract(config.tokenAddress, ERC20_ABI, wallet!);
+  const ok = await once(() => r.burnTx || "", (h) => (r.burnTx = h), (o) => token.transfer(DEAD, amount, o));
+  if (!ok) throw new Error(`Round #${r.n}: the transfer to the dead address reverted`);
+  count(r, "burn", () => {
+    state.totals.burnWei = add(state.totals.burnWei, pay);
+    state.totals.burnedRaw = add(state.totals.burnedRaw, amount);
+  });
+  log("success", `Burn #${r.n}: ${ethers.formatEther(pay)} ETH bought ${fmt(amount)} ${TICKER}, sent to the dead address (${r.burnTx})`);
+  return true;
+}
+
 async function keep(r: Round) {
   status = "keeper";
   const pay = big(r.payWei);
-  const ok = await once(() => r.treasuryTx, (h) => (r.treasuryTx = h), () => wallet!.sendTransaction({ to: config.treasuryAddress, value: pay }));
+  const ok = await once(() => r.treasuryTx, (h) => (r.treasuryTx = h), (o) => wallet!.sendTransaction({ to: config.treasuryAddress, value: pay, ...o }));
   if (!ok) throw new Error(`Round #${r.n}: treasury transfer reverted`);
   count(r, "keeper", () => (state.totals.keeperWei = add(state.totals.keeperWei, pay)));
   log("success", `Keeper #${r.n}: ${ethers.formatEther(pay)} ETH → treasury (${r.treasuryTx})`);
@@ -368,7 +530,7 @@ async function runCycle() {
 
   // Feedings use a fresh balance book.
   if (r.kind === "feeding" && state.lastIndexedBlock < (await provider.getBlockNumber()) - 5) return;
-  const finished = r.kind === "feeding" ? await feed(r) : await keep(r);
+  const finished = r.kind === "feeding" ? await feed(r) : r.kind === "burn" ? await burn(r) : await keep(r);
   if (!finished) return;
   r.stage = "done";
   r.doneAt = Math.floor(Date.now() / 1000);
@@ -412,6 +574,8 @@ async function tick() {
       }
     }
     decimals = Number(await token.decimals().catch(() => 18));
+    if (supplyRaw === 0n) supplyRaw = await token.totalSupply().catch(() => 0n);
+    await learnPool();
     status = "indexing";
     await indexTransfers();
     await runCycle();
@@ -421,8 +585,12 @@ async function tick() {
     }
     status = "idle";
   } catch (e: any) {
-    status = "error";
-    log("error", errText(e));
+    if (e instanceof Waiting) {
+      note(e.message);
+    } else {
+      status = "error";
+      log("error", errText(e));
+    }
   } finally {
     busy = false;
   }
@@ -519,11 +687,19 @@ function counts(now: number) {
   return { sitters, waiting, hopped, holders };
 }
 
-/** A sitter's share of the next feeding, if it is in the top N right now. */
-function estimateNext(addr: string, now: number) {
+/** How a feeding of `pay` is shared right now: the spark's cut first, the rest to the top N by tier and balance. */
+function planFeeding(pay: bigint, now: number) {
   const top = sittersByBalance(now).slice(0, config.feedingTopN);
+  const spark = sparkLeader(now);
+  const sparkPay = spark ? (pay * BigInt(config.sparkPct)) / 100n : 0n;
+  return { top, spark, sparkPay, split: splitFeeding(pay - sparkPay, top.map((s) => big(s.h.balance))) };
+}
+
+/** What a wallet would get from the next feeding as things stand: its top-N share, plus the spark if it leads. */
+function estimateNext(addr: string, now: number) {
+  const { top, split, spark, sparkPay } = planFeeding(ethers.parseEther(config.feedingETH), now);
   const i = top.findIndex((s) => s.addr === addr);
-  return i === -1 ? 0n : splitFeeding(ethers.parseEther(config.feedingETH), top.map((s) => big(s.h.balance)))[i];
+  return (i === -1 ? 0n : split[i]) + (spark?.addr === addr ? sparkPay : 0n);
 }
 
 /** The tiers, cut to the top N, as rank ranges (1-based, inclusive). Without tiers: one tier of N. */
@@ -563,10 +739,12 @@ function roundRow(r: Round) {
     claimTx: r.claimTx,
     claimedETH: ethOf(r.claimedWei),
     spentETH: ethOf(r.payWei),
-    recipients: r.payouts.filter((p) => !p.skipped).length,
+    recipients: r.payouts.filter((p) => !p.skipped && !p.spark).length,
     fedETH: ethOf(paid),
+    sparkETH: ethOf(r.payouts.filter((p) => p.spark && !p.skipped && p.tx).reduce((t, p) => t + big(p.amount), 0n)),
+    burnedTokens: fmt(r.burnedRaw || "0"),
     treasuryTx: r.treasuryTx,
-    tx: r.kind === "feeding" ? r.payouts.find((p) => p.tx)?.tx || "" : r.treasuryTx,
+    tx: r.kind === "feeding" ? r.payouts.find((p) => p.tx)?.tx || "" : r.kind === "burn" ? r.burnTx || "" : r.treasuryTx,
     doneAt: r.doneAt,
   };
 }
@@ -633,14 +811,21 @@ const server = http.createServer((req, res) => {
           minBalance: config.minBalance,
           minHoldHours: config.minHoldHours,
           topN: config.feedingTopN,
-          tiers: tiers().map((t) => ({ ...t, eth: ethers.formatEther((ethers.parseEther(config.feedingETH) * BigInt(t.pct)) / 100n) })),
+          // what each tier shares once the spark has taken its cut (with no spark, the ten share all of it)
+          tiers: tiers().map((t) => ({ ...t, eth: ethers.formatEther((ethers.parseEther(config.feedingETH) * BigInt(100 - config.sparkPct) * BigInt(t.pct)) / 10000n) })),
+          sparkPct: config.sparkPct,
+          sparkETH: ethers.formatEther((ethers.parseEther(config.feedingETH) * BigInt(config.sparkPct)) / 100n),
         },
         counts: counts(now),
         totals: {
           feesClaimedETH: ethOf(state.totals.feesClaimedWei),
           fedETH: ethOf(state.totals.fedWei),
+          sparkETH: ethOf(state.totals.sparkWei),
+          burnETH: ethOf(state.totals.burnWei),
+          burnedTokens: fmt(state.totals.burnedRaw),
           keeperETH: ethOf(state.totals.keeperWei),
         },
+        supply: fmt(supplyRaw),
         rounds: state.rounds.filter((r) => r.stage === "done").length,
         lastIndexedBlock: state.lastIndexedBlock,
         logs: logs.slice(0, 40),
@@ -691,7 +876,12 @@ const server = http.createServer((req, res) => {
         sold: Object.entries(state.holders)
           .filter(([, h]) => h.hopped && now - h.hoppedAt < 900)
           .map(([a]) => a),
-        // The dev (the creator wallet the engine runs on): shown at the front desk, never ranked or paid.
+        // The wallet leading this round's buying; it takes the spark at the next feeding if nobody buys more.
+        spark: (() => {
+          const s = sparkLeader(now);
+          return s ? { addr: s.addr, bought: fmt(s.bought), nickname: bylineOf(s.addr), pp: mugshotOf(s.addr), x: xOf(s.addr) } : null;
+        })(),
+        // The dev (the creator wallet the engine runs on): shown apart, never ranked or paid.
         house: wallet
           ? (() => {
               const a = lc(wallet.address);
@@ -725,6 +915,8 @@ const server = http.createServer((req, res) => {
         inTop: rank !== -1 && rank < config.feedingTopN,
         topN: config.feedingTopN,
         estNext: ethOf(estimateNext(addr, now)),
+        bought: fmt(h?.bought || "0"),
+        spark: sparkLeader(now)?.addr === addr,
         nickname: bylineOf(addr),
         pp: mugshotOf(addr),
         x: xOf(addr),
@@ -761,6 +953,7 @@ const server = http.createServer((req, res) => {
             config.tokenAddress = ethers.getAddress(d.tokenAddress.trim());
             config.curveAddress = "";
             config.startBlock = 0;
+            supplyRaw = 0n;
             resetStateForToken();
             log("info", `[CONFIG] Token set: ${config.tokenAddress}`);
           }
@@ -817,7 +1010,7 @@ const server = http.createServer((req, res) => {
       const addr = lc(d.addr);
       const bad = spendNonce(addr, d.nonce, d.signature, (n) => xMessage(addr, "link", n));
       if (bad) return send(res, 400, { success: false, error: bad });
-      if (!(big(state.holders[addr]?.balance || "0") > 0n)) return send(res, 400, { success: false, error: "Only wallets holding $HANG can link X." });
+      if (!(big(state.holders[addr]?.balance || "0") > 0n)) return send(res, 400, { success: false, error: `Only wallets holding ${TICKER} can link X.` });
       try {
         return send(res, 200, { success: true, data: { url: startLink(addr) } });
       } catch (e: any) {
@@ -944,5 +1137,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(config.port, "127.0.0.1", () => {
-  log("info", `$HANG engine API on 127.0.0.1:${config.port} · ${isAddr(config.tokenAddress) ? `token ${config.tokenAddress}` : "STANDBY (set the token in /lotnok)"}`);
+  log("info", `${TICKER} engine API on 127.0.0.1:${config.port} · ${isAddr(config.tokenAddress) ? `token ${config.tokenAddress}` : "STANDBY (set the token in /lotnok)"}`);
 });

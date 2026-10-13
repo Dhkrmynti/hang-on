@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-export type RoundKind = "feeding" | "keeper";
+export type RoundKind = "feeding" | "burn" | "keeper";
 
 export interface Status {
   online: boolean;
@@ -10,12 +10,16 @@ export interface Status {
   curveAddress: string;
   treasuryAddress: string;
   escrowETH: string;
-  /** Display-only prices: USD per $HANG and per ETH (0 when unknown). */
+  /** Display-only prices: USD per token and per ETH (0 when unknown). */
   price?: { tokenUSD: number; ethUSD: number; source: string; at: number };
   cycle: { index: number; kind: RoundKind; thresholdETH: string; steps: { kind: RoundKind; thresholdETH: string }[] };
-  rules: { minBalance: string; minHoldHours: number; topN: number; tiers?: Tier[] };
+  /** `sparkPct` of every reward goes to the spark (`sparkETH` of a full one); the tiers share the rest. */
+  rules: { minBalance: string; minHoldHours: number; topN: number; tiers?: Tier[]; sparkPct?: number; sparkETH?: string };
   counts: { sitters: number; waiting: number; hopped: number; holders: number };
-  totals: { feesClaimedETH: string; fedETH: string; keeperETH: string };
+  /** `fedETH` went to the ten, `sparkETH` to sparks, `burnETH` bought the `burnedTokens` now at the dead address. */
+  totals: { feesClaimedETH: string; fedETH: string; sparkETH?: string; burnETH?: string; burnedTokens?: string; keeperETH: string };
+  /** Whole supply as minted, in tokens ("0" until the engine has read it). */
+  supply?: string;
   rounds: number;
   lastIndexedBlock: number;
   logs?: { t: number; type: string; msg: string }[];
@@ -30,7 +34,7 @@ export interface XProfile {
   verified: string;
 }
 
-/** A band of ranks inside the top N that shares `eth` of each inheritance, by balance. */
+/** A band of ranks inside the top N that shares `eth` of each reward (after the spark's cut), by balance. */
 export interface Tier {
   from: number;
   to: number;
@@ -39,14 +43,14 @@ export interface Tier {
 }
 
 export const DEFAULT_TIERS: Tier[] = [
-  { from: 1, to: 5, pct: 70, eth: "0.014" },
-  { from: 6, to: 10, pct: 30, eth: "0.006" },
+  { from: 1, to: 5, pct: 70, eth: "0.0105" },
+  { from: 6, to: 10, pct: 30, eth: "0.0045" },
 ];
 
-/** Which tier (1-based) a rank sits in, 0 outside the inheritance zone. */
+/** Which tier (1-based) a rank sits in, 0 outside the top N. */
 export const tierOf = (rank: number, tiers: Tier[] = DEFAULT_TIERS) => tiers.findIndex((t) => rank >= t.from && rank <= t.to) + 1;
 
-/** Splits one inheritance the engine's way: each tier its share, by balance inside the tier. */
+/** Splits the ten's part of a reward the engine's way: each tier its share, by balance inside the tier. */
 export function splitInheritance(pay: number, balances: number[], tiers: Tier[] = DEFAULT_TIERS) {
   const out = balances.map(() => 0);
   const live = tiers.filter((t) => t.from <= balances.length);
@@ -73,7 +77,7 @@ export interface PondRow {
   received: string;
   /** The holder's claimed byline, empty when unclaimed (the site then prints a house name). */
   nickname?: string;
-  /** Claimed mugshot parts [fur, hat, accessory, background]; null means the generated one. */
+  /** Claimed skull parts [bone, horns, sockets, background]; null means the generated one. */
   pp?: number[] | null;
   /** Linked X account; when set it replaces the nickname and mugshot. */
   x?: XProfile | null;
@@ -92,8 +96,12 @@ export interface WalletInfo {
   rank: number | null;
   inTop: boolean;
   topN: number;
-  /** ETH this wallet would get from the next feeding at today's balances. */
+  /** ETH this wallet would get from the next feeding at today's balances (the spark included, if it leads). */
   estNext: string;
+  /** Tokens bought since the last reward and not moved on. */
+  bought?: string;
+  /** Leading this round's buying: the spark is this wallet's unless someone buys more. */
+  spark?: boolean;
   nickname?: string;
   pp?: number[] | null;
   x?: XProfile | null;
@@ -113,7 +121,11 @@ export interface RoundRow {
   claimedETH: string;
   spentETH: string;
   recipients: number;
+  /** Everything a reward round paid out, the spark's cut (`sparkETH`) included. */
   fedETH: string;
+  sparkETH?: string;
+  /** Burn rounds: the tokens bought and sent to the dead address. */
+  burnedTokens?: string;
   treasuryTx: string;
   tx: string;
   doneAt: number;
@@ -121,18 +133,20 @@ export interface RoundRow {
 
 /** The cycle, in plain names. */
 export const STEP: Record<RoundKind, { name: string; does: string }> = {
-  feeding: { name: "Reward", does: "ETH to the ten on the branches" },
+  feeding: { name: "Reward", does: "ETH to the front row and the biggest flowers" },
+  burn: { name: "Burn", does: "bought and sent to the dead address" },
   keeper: { name: "Treasury", does: "to the treasury wallet" },
 };
 
 export const DEFAULT_STEPS: Status["cycle"]["steps"] = [
   { kind: "feeding", thresholdETH: "0.02" },
-  { kind: "keeper", thresholdETH: "0.025" },
+  { kind: "burn", thresholdETH: "0.02" },
+  { kind: "keeper", thresholdETH: "0.01" },
 ];
 
 /** Share of all fees each step gets over one full cycle, in whole percent. */
 export function stepShare(steps: Status["cycle"]["steps"], kind: RoundKind) {
-  const kinds: RoundKind[] = ["feeding", "keeper"];
+  const kinds: RoundKind[] = ["feeding", "burn", "keeper"];
   const total = steps.reduce((t, s) => t + parseFloat(s.thresholdETH), 0);
   if (!(total > 0)) return 0;
   // Whole percents that still add up to 100 (largest remainder).
@@ -347,9 +361,10 @@ export const demoStatus = (): Status => ({
   escrowETH: "0.0063",
   price: { tokenUSD: 0.0000412, ethUSD: 3180, source: "illustration", at: 0 },
   cycle: { index: 0, kind: "feeding", thresholdETH: "0.02", steps: DEFAULT_STEPS },
-  rules: { minBalance: "100000", minHoldHours: 0, topN: 10, tiers: DEFAULT_TIERS },
+  rules: { minBalance: "100000", minHoldHours: 0, topN: 10, tiers: DEFAULT_TIERS, sparkPct: 25, sparkETH: "0.005" },
   counts: { sitters: 87, waiting: 23, hopped: 41, holders: 151 },
-  totals: { feesClaimedETH: "0.8145", fedETH: "0.3618", keeperETH: "0.4518" },
+  totals: { feesClaimedETH: "0.6012", fedETH: "0.1803", sparkETH: "0.0601", burnETH: "0.2404", burnedTokens: "18524000", keeperETH: "0.1204" },
+  supply: "1000000000",
   rounds: 36,
   lastIndexedBlock: 82931447,
 });
@@ -369,7 +384,7 @@ const seedAddrs = [
   "0x0e7b4d1a8f5c2e9b6d3a0f7c4e1b8d5a2f9c6e3b",
 ];
 
-/** The dev's wallet as the pond reports it: shown with a crown, never ranked or paid. */
+/** The dev's wallet as the pond reports it: shown apart as the moth, never ranked or paid. */
 export interface HouseRow {
   addr: string;
   balance: string;
@@ -386,8 +401,16 @@ export interface WaitingRow {
   pp: number[] | null;
   x: XProfile | null;
 }
+/** The wallet that bought the most since the last reward; `bought` is that amount in tokens. */
+export interface SparkRow {
+  addr: string;
+  bought: string;
+  nickname: string;
+  pp: number[] | null;
+  x: XProfile | null;
+}
 /** `sold` lists wallets that sold in the last few minutes, whatever they still hold. */
-export type Pond = { total: number; topN: number; rows: PondRow[]; house?: HouseRow | null; waiting?: WaitingRow[]; out?: HouseRow[]; sold?: string[] };
+export type Pond = { total: number; topN: number; rows: PondRow[]; house?: HouseRow | null; spark?: SparkRow | null; waiting?: WaitingRow[]; out?: HouseRow[]; sold?: string[] };
 
 export const demoPond = (): Pond => {
   const base = seedPond();
@@ -400,7 +423,10 @@ export const demoPond = (): Pond => {
   rows.sort((a, b) => parseFloat(b.balance) - parseFloat(a.balance));
   rows.forEach((row, i) => ((row.rank = i + 1), (row.inTop = i < 10), (row.tier = tierOf(i + 1))));
   const house: HouseRow = { addr: "0x5175d9e2b0a4c8e6f1d3b7a9c2e4f6081a3c5e7b", balance: String(12.5e6), nickname: "", pp: null, x: null };
-  return { ...base, rows, house };
+  // this round's biggest buyer is someone well outside the ten
+  const buyer = rows[16];
+  const spark: SparkRow = { addr: buyer.addr, bought: String(96000), nickname: buyer.nickname ?? "", pp: buyer.pp ?? null, x: buyer.x ?? null };
+  return { ...base, rows, house, spark };
 };
 
 const seedPond = (): { total: number; topN: number; rows: PondRow[] } => {
@@ -428,7 +454,7 @@ const seedPond = (): { total: number; topN: number; rows: PondRow[] } => {
       firstIn: now() - days[i] * 86400 - 3600 * i,
       padDays: days[i],
       received: String(rec[i]),
-      nickname: ["slowpoke", "", "three toes", "", "", "mossback", "", "", "", "", "", ""][i] || "",
+      nickname: ["cinder", "", "old tooth", "", "", "ashmaw", "", "", "", "", "", ""][i] || "",
       pp: [[1, 4, 3, 3], null, [2, 0, 2, 4], null, null, [4, 2, 4, 5], null, null, null, null, null, null][i] ?? null,
       x: null,
     })),
@@ -440,9 +466,9 @@ const demoHash = (k: number) => `0x${(k * 104729 + 17).toString(16).padStart(8, 
 export const demoRounds = (): RoundRow[] =>
   Array.from({ length: 12 }, (_, k) => {
     const n = 36 - k;
-    // newest first: … treasury, reward, treasury, reward …
-    const kind = (["keeper", "feeding"] as const)[k % 2];
-    const claimed = kind === "keeper" ? 0.0251 : 0.0201 + (k % 4) * 0.0002;
+    // newest first: … treasury, burn, reward, treasury, burn, reward …
+    const kind = (["keeper", "burn", "feeding"] as const)[k % 3];
+    const claimed = kind === "keeper" ? 0.0101 : 0.0201 + (k % 4) * 0.0002;
     return {
       n,
       kind,
@@ -453,6 +479,8 @@ export const demoRounds = (): RoundRow[] =>
       spentETH: claimed.toFixed(4),
       recipients: kind === "feeding" ? 10 : 0,
       fedETH: kind === "feeding" ? claimed.toFixed(4) : "0",
+      sparkETH: kind === "feeding" ? (claimed * 0.25).toFixed(4) : "0",
+      burnedTokens: kind === "burn" ? String(1.5e6 + k * 9000) : "0",
       treasuryTx: kind === "keeper" ? demoHash(k + 50) : "",
       tx: demoHash(k + 200),
       doneAt: now() - k * 5400 - 840,
@@ -467,7 +495,8 @@ export function demoWallet(addr: string): WalletInfo {
   if (hopped)
     return { ...base, status: "hopped", balance: "0", firstIn: now() - 12 * 86400, padDays: 12, received: "0.0042", hoppedAt: now() - 2 * 86400, hoppedTx: demoHash(3), rank: null, inTop: false, estNext: "0" };
   const bal = row ? parseFloat(row.balance) : 410000;
-  const split = splitInheritance(0.02, pond.rows.filter((r) => r.inTop).map((r) => parseFloat(r.balance)));
+  const split = splitInheritance(0.015, pond.rows.filter((r) => r.inTop).map((r) => parseFloat(r.balance)));
+  const spark = pond.spark?.addr.toLowerCase() === addr.toLowerCase();
   const rank = row?.rank ?? 34;
   const inTop = rank <= 10;
   return {
@@ -483,6 +512,8 @@ export function demoWallet(addr: string): WalletInfo {
     pp: row?.pp ?? null,
     x: row?.x ?? null,
     xLogin: true,
-    estNext: inTop ? String(split[rank - 1] ?? 0) : "0",
+    estNext: String((inTop ? split[rank - 1] ?? 0 : 0) + (spark ? 0.005 : 0)),
+    bought: spark ? pond.spark!.bought : "0",
+    spark,
   };
 }

@@ -1,10 +1,11 @@
-/** Small shared pieces: the buy button, the contract address, how a holder is shown, the wallet button. */
+/** Small shared pieces: the buy button, the contract address, how a holder is shown, the wallet button, a line set in words. */
 import { useEffect, useState } from "react";
 import { ArrowUpRight, Check, Copy, SealCheck, Wallet, XLogo } from "@phosphor-icons/react";
 import { DEMO, demoPond, ponsUrl, short, xUrl, type Status, type XProfile } from "../lib/api";
 import { connectWallet, hasWallet, pretendAccount, useAccount } from "../lib/wallet";
 import { TICKER } from "../lib/brand";
-import { Portrait, slothOf } from "./Sloth";
+import { nameFor } from "../lib/alias";
+import { Portrait, skullOf } from "./Skull";
 import { openTag } from "./Card";
 
 export function useMedia(query: string) {
@@ -67,13 +68,13 @@ export function CaCopy({ status, compact = false }: { status: Status | null; com
 
 /**
  * How a holder is pictured: a linked X account shows its own picture; everyone else gets their
- * sloth. The X picture falls back to the sloth if X ever stops serving it.
+ * skull. The X picture falls back to the skull if X ever stops serving it.
  */
 export function Face({ addr, pp, x, size, className = "" }: { addr: string; pp?: number[] | null; x?: XProfile | null; size: number; className?: string }) {
   const [broken, setBroken] = useState(false);
   if (x?.avatar && !broken)
     return <img className={`xface ${className}`} src={x.avatar} width={size} height={size} alt="" referrerPolicy="no-referrer" onError={() => setBroken(true)} />;
-  return <Portrait traits={slothOf(addr, pp)} size={size} className={className} />;
+  return <Portrait traits={skullOf(addr, pp)} size={size} className={className} />;
 }
 
 const BADGE: Record<string, string> = { blue: "Verified on X", business: "Verified organization on X", government: "Government account on X" };
@@ -95,7 +96,7 @@ export function XLink({ x, className = "" }: { x: XProfile; className?: string }
 
 /**
  * The header's wallet button. Connecting opens the holder's own tag, already unlocked for a
- * name, sloth or X link. It never asks for a transaction.
+ * name, skull or X link. It never asks for a transaction.
  */
 export function ConnectButton({ className = "" }: { className?: string }) {
   const account = useAccount();
@@ -127,5 +128,36 @@ export function ConnectButton({ className = "" }: { className?: string }) {
       {account ? <span className="connect__dot" aria-hidden="true" /> : <Wallet weight="bold" aria-hidden="true" />}
       <span className="connect__label num">{busy ? "Connecting" : account ? short(account) : "Connect"}</span>
     </button>
+  );
+}
+
+/** A holder by face and name; pressing the name opens their card. */
+export function Who({ addr, nickname, pp, x, size = 28 }: { addr: string; nickname?: string; pp?: number[] | null; x?: XProfile | null; size?: number }) {
+  const who = nameFor(addr, nickname, x ?? null);
+  return (
+    <span className="who">
+      {size > 0 ? <Face addr={addr} pp={pp ?? null} x={x ?? null} size={size} className="who__face" /> : null}
+      {x ? <XLink x={x} className="who__x" /> : null}
+      <button type="button" className="who__name" onClick={() => openTag(addr)} aria-label={`Open the card of ${who.name}`}>
+        {who.name}
+      </button>
+      {x ? <XCheck x={x} /> : null}
+    </span>
+  );
+}
+
+/** A line set word by word, so each word can be moved on its own. Read aloud as the one line it is. */
+export function Words({ text }: { text: string }) {
+  const words = text.split(" ");
+  return (
+    <>
+      <span className="sr-only">{text}</span>
+      {words.map((w, i) => (
+        <span key={i} aria-hidden="true">
+          <span className="w">{w}</span>
+          {i < words.length - 1 ? " " : ""}
+        </span>
+      ))}
+    </>
   );
 }

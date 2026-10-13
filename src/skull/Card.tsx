@@ -1,19 +1,19 @@
 /**
- * Find your sloth: look up any wallet and get its specimen card, with where it hangs and what it
- * has been paid. The holder of the wallet can then groom it: a name, a sloth,
+ * The cloakroom: look up any wallet and get its card, with where it stands and what it
+ * has been paid. The holder of the wallet can then dress it: a name, a skull,
  * or an X account, set by signing one plain message. No transaction is ever requested.
  */
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import gsap from "gsap";
 import { useGSAP } from "@gsap/react";
 import { CaretLeft, CaretRight, Check, LinkSimple, MagnifyingGlass, PenNib, SealCheck, Wallet, XLogo } from "@phosphor-icons/react";
-import { DEMO, addrUrl, amount, bylineNonce, claimByline, dateWib, demoSaveByline, demoWallet, eth, fetchWallet, short, startXDemo, startXLink, takeXDemo, txUrl, unlinkX, type WalletInfo } from "../lib/api";
+import { DEMO, addrUrl, amount, bylineNonce, compact, claimByline, dateWib, demoSaveByline, demoWallet, eth, fetchWallet, short, startXDemo, startXLink, takeXDemo, txUrl, unlinkX, type WalletInfo } from "../lib/api";
 import { nameFor } from "../lib/alias";
 import { prefersReducedMotion } from "../lib/motion";
 import { connectWallet, hasWallet, signText, useAccount } from "../lib/wallet";
 import { NAME, TICKER } from "../lib/brand";
 import { Face, XCheck, XLink } from "./Bits";
-import { Mark, PARTS, PART_NAMES, Portrait, slothOf, type Traits } from "./Sloth";
+import { Mark, PARTS, PART_NAMES, Portrait, skullOf, type Traits } from "./Skull";
 
 gsap.registerPlugin(useGSAP);
 
@@ -21,17 +21,17 @@ const VALID = /^0x[0-9a-fA-F]{40}$/;
 
 type Tone = "ok" | "wait" | "stop" | "dim";
 const STAMP: Record<WalletInfo["status"], { word: string; tone: Tone; line: string }> = {
-  sitting: { word: "On the tree", tone: "ok", line: "You are on the tree. Hold and climb to a branch." },
-  waiting: { word: "Reaching up", tone: "wait", line: `Your first ${TICKER} are still settling. A moment.` },
-  "too-small": { word: "Outside", tone: "wait", line: `Under 100,000 ${TICKER}. Not enough to get a grip. Hold more.` },
-  hopped: { word: "Let go", tone: "stop", line: "This wallet sold. It let go, and it is on the ground for good." },
-  excluded: { word: "Staff", tone: "dim", line: "Engine, curve, treasury or dead address. Never on a branch, never paid." },
+  sitting: { word: "At the wake", tone: "ok", line: "You are at the wake. Hold more to reach the front row." },
+  waiting: { word: "At the door", tone: "wait", line: `Your first ${TICKER} are still settling. A moment.` },
+  "too-small": { word: "Too small", tone: "wait", line: `Under 100,000 ${TICKER}. Not enough to count. Hold more.` },
+  hopped: { word: "Cremated", tone: "stop", line: "This wallet left early. It was cremated and is never paid again." },
+  excluded: { word: "Staff", tone: "dim", line: "Engine, curve, treasury or dead address. Never seated, never paid." },
   "not-holding": { word: "Not here", tone: "dim", line: `This wallet holds no ${TICKER}.` },
 };
 
 /** What X sign-in came back with (?x=…), read once and then cleared from the address bar. */
 const X_RESULT: Record<string, { ok: boolean; text: string }> = {
-  linked: { ok: true, text: "X linked. The tree now shows your X handle, picture and badge." },
+  linked: { ok: true, text: "X linked. The page now shows your X handle, picture and badge." },
   demo: { ok: true, text: "X linked for real: that's your handle, picture and badge. Demo page, so nothing was saved." },
   cancelled: { ok: false, text: "X sign-in cancelled. Nothing changed." },
   expired: { ok: false, text: "The X sign-in took too long. Try again." },
@@ -62,9 +62,9 @@ export function openTag(addr: string) {
 }
 
 const SLOTS = [
-  ["fur", "Coat"],
-  ["hat", "On the head"],
-  ["acc", "Extras"],
+  ["fur", "Bone"],
+  ["hat", "Worn"],
+  ["acc", "Face"],
   ["bg", "Behind"],
 ] as const;
 
@@ -82,12 +82,12 @@ function ChangingRoom({ info, onSaved, flash }: { info: WalletInfo; onSaved: (pa
     if (hasX) setTab("x");
   }, [hasX]);
   const [name, setName] = useState(info.nickname || "");
-  const [sloth, setSloth] = useState<Traits>(slothOf(info.addr, info.pp));
+  const [skull, setSkull] = useState<Traits>(skullOf(info.addr, info.pp));
   const turn = (slot: number, by: number) => {
     const max = [PARTS.fur, PARTS.hat, PARTS.acc, PARTS.bg][slot];
-    const next = [...sloth] as Traits;
+    const next = [...skull] as Traits;
     next[slot] = (next[slot] + by + max) % max;
-    setSloth(next);
+    setSkull(next);
   };
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<{ ok: boolean; text: string } | null>(flash);
@@ -117,18 +117,18 @@ function ChangingRoom({ info, onSaved, flash }: { info: WalletInfo; onSaved: (pa
     const tidy = name.replace(/\s+/g, " ").trim();
     if (DEMO) {
       if (tidy.length < 3 || tidy.length > 18 || !/^[A-Za-z0-9 _'-]+$/.test(tidy)) return setNote({ ok: false, text: "Names are 3 to 18 letters, numbers, spaces, - ' or _." });
-      demoSaveByline(info.addr, { nickname: tidy, pp: sloth });
-      onSaved({ nickname: tidy, pp: sloth });
-      return setNote({ ok: true, text: `Saved. You're "${tidy}" on the tree now. (Demo page: on this page only.)` });
+      demoSaveByline(info.addr, { nickname: tidy, pp: skull });
+      onSaved({ nickname: tidy, pp: skull });
+      return setNote({ ok: true, text: `Saved. You're "${tidy}" now. (Demo page: on this page only.)` });
     }
     try {
       setBusy(true);
       const clean = name.replace(/\s+/g, " ").trim();
       const { nonce, template } = await bylineNonce(info.addr);
-      const signature = await signText(account, template.replace("{nickname}", clean).replace("{mugshot}", sloth.join("-")));
-      const saved = await claimByline(info.addr, clean, sloth, nonce, signature);
+      const signature = await signText(account, template.replace("{nickname}", clean).replace("{mugshot}", skull.join("-")));
+      const saved = await claimByline(info.addr, clean, skull, nonce, signature);
       onSaved({ nickname: saved.nickname, pp: saved.pp });
-      setNote({ ok: true, text: `Saved. You're "${saved.nickname}" on the tree now.` });
+      setNote({ ok: true, text: `Saved. You're "${saved.nickname}" now.` });
       window.dispatchEvent(new Event("rbank:refresh"));
     } catch (e: any) {
       setNote({ ok: false, text: e?.code === 4001 ? "You cancelled the signature. Nothing was saved." : e?.message || "Couldn't save the name." });
@@ -184,7 +184,7 @@ function ChangingRoom({ info, onSaved, flash }: { info: WalletInfo; onSaved: (pa
       fetch("/api/x/demo/unlink", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ addr: info.addr }) }).catch(() => {});
       onSaved({ x: null });
       setTab("name");
-      return setNote({ ok: true, text: "X unlinked. The tree shows your name and sloth again." });
+      return setNote({ ok: true, text: "X unlinked. The page shows your name and skull again." });
     }
     try {
       setBusy(true);
@@ -192,7 +192,7 @@ function ChangingRoom({ info, onSaved, flash }: { info: WalletInfo; onSaved: (pa
       await unlinkX(info.addr, nonce, await signText(account, text));
       onSaved({ x: null });
       setTab("name");
-      setNote({ ok: true, text: "X unlinked. The tree shows your name and sloth again." });
+      setNote({ ok: true, text: "X unlinked. The page shows your name and skull again." });
       window.dispatchEvent(new Event("rbank:refresh"));
     } catch (e: any) {
       failed(e, "Couldn't unlink X.");
@@ -204,13 +204,13 @@ function ChangingRoom({ info, onSaved, flash }: { info: WalletInfo; onSaved: (pa
   if (!open)
     return (
       <button type="button" className="btn is-line room__open" onClick={() => setOpen(true)}>
-        <PenNib weight="bold" aria-hidden="true" /> {info.x ? "Manage X link" : info.nickname ? "Edit name, sloth or connect X" : "Set your name, sloth or connect X"}
+        <PenNib weight="bold" aria-hidden="true" /> {info.x ? "Manage X link" : info.nickname ? "Edit name, skull or connect X" : "Set your name, skull or connect X"}
       </button>
     );
 
   return (
     <div className="room">
-      <p className="room__head">Grooming</p>
+      <p className="room__head">Dressing</p>
       {!mine ? (
         <>
           <button type="button" className="btn is-line" onClick={connect} disabled={busy}>
@@ -220,9 +220,9 @@ function ChangingRoom({ info, onSaved, flash }: { info: WalletInfo; onSaved: (pa
         </>
       ) : (
         <>
-          <div className="room__tabs" role="tablist" aria-label="How the tree shows you">
+          <div className="room__tabs" role="tablist" aria-label="How the page shows you">
             <button type="button" role="tab" aria-selected={tab === "name"} className="room__tab" onClick={() => setTab("name")}>
-              <PenNib weight="bold" aria-hidden="true" /> Name & sloth
+              <PenNib weight="bold" aria-hidden="true" /> Name & skull
             </button>
             <button type="button" role="tab" aria-selected={tab === "x"} className="room__tab" onClick={() => setTab("x")}>
               <XLogo weight="bold" aria-hidden="true" /> Connect X
@@ -270,7 +270,7 @@ function ChangingRoom({ info, onSaved, flash }: { info: WalletInfo; onSaved: (pa
             </div>
           ) : info.x ? (
             <p className="help" role="tabpanel">
-              Your X account is showing right now. Unlink X on the other tab to set a name and sloth instead.
+              Your X account is showing right now. Unlink X on the other tab to set a name and skull instead.
             </p>
           ) : (
             <form
@@ -282,10 +282,10 @@ function ChangingRoom({ info, onSaved, flash }: { info: WalletInfo; onSaved: (pa
             >
               <div className="dress">
                 <Portrait
-                  traits={sloth}
+                  traits={skull}
                   size={132}
                   className="dress__shot"
-                  title={`Your sloth: ${PART_NAMES.fur[sloth[0]]} coat, ${PART_NAMES.hat[sloth[1]]}, ${PART_NAMES.acc[sloth[2]]}, ${PART_NAMES.bg[sloth[3]]}`}
+                  title={`Your skull: ${PART_NAMES.fur[skull[0]]}, ${PART_NAMES.hat[skull[1]]}, ${PART_NAMES.acc[skull[2]]}, ${PART_NAMES.bg[skull[3]]}`}
                 />
                 <div className="dress__dials">
                   {SLOTS.map(([key, label], i) => (
@@ -294,7 +294,7 @@ function ChangingRoom({ info, onSaved, flash }: { info: WalletInfo; onSaved: (pa
                       <button type="button" className="dress__turn" onClick={() => turn(i, -1)} aria-label={`Previous ${label.toLowerCase()}`}>
                         <CaretLeft weight="bold" />
                       </button>
-                      <span className="dress__value">{PART_NAMES[key][sloth[i]]}</span>
+                      <span className="dress__value">{PART_NAMES[key][skull[i]]}</span>
                       <button type="button" className="dress__turn" onClick={() => turn(i, 1)} aria-label={`Next ${label.toLowerCase()}`}>
                         <CaretRight weight="bold" />
                       </button>
@@ -346,7 +346,7 @@ export function Tag({ live }: { live: boolean }) {
       url.searchParams.set("w", addr);
       window.history.replaceState(null, "", url);
     } catch (e: any) {
-      setError(e?.message === "Not Found" || !live ? "The tree isn't open yet: nothing to check." : "Couldn't reach the engine. Try again in a moment.");
+      setError(e?.message === "Not Found" || !live ? "The wake hasn't started yet: nothing to check." : "Couldn't reach the engine. Try again in a moment.");
     } finally {
       setBusy(false);
     }
@@ -386,7 +386,7 @@ export function Tag({ live }: { live: boolean }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // A fresh card is developed like a plate, top to bottom, and then it is stamped.
+  // A fresh card is revealed top to bottom, and then it is stamped.
   useGSAP(
     () => {
       if (!info || prefersReducedMotion()) return;
@@ -409,22 +409,22 @@ export function Tag({ live }: { live: boolean }) {
     } catch {}
   };
 
-  const base = info ? (info.house ? { word: "Toucan", tone: "ok" as Tone, line: "The dev wallet. Watches from its perch, never hangs, never paid." } : STAMP[info.status]) : null;
+  const base = info ? (info.house ? { word: "Undertaker", tone: "dim" as Tone, line: "The dev wallet. It has no seat and is never paid." } : STAMP[info.status]) : null;
   // Holders outside the top N get no share yet: say how far there is to climb.
   const stamp =
     info && base && info.status === "sitting" && !info.inTop
-      ? { ...base, word: "Climbing", tone: "wait" as const, line: `No. ${info.rank}, on the trunk. Only the top ${info.topN} get a branch: climb ${info.rank! - info.topN} more.` }
+      ? { ...base, word: "At the back", tone: "wait" as const, line: `No. ${info.rank}, standing at the back. Only the top ${info.topN} get the front row: ${info.rank! - info.topN} places to go.` }
       : info && base && info.status === "sitting"
-        ? { ...base, word: info.rank === 1 ? "Hammock" : "Hanging", line: info.rank === 1 ? "You hold the most. The hammock and the biggest share of the next reward are yours." : `Branch spot No. ${info.rank}. You share the next reward.` }
+        ? { ...base, word: info.rank === 1 ? "Chief mourner" : "Front row", line: info.rank === 1 ? "You hold the most. The first seat and the biggest share of the next reward are yours." : `Seat ${info.rank} in the front row. You share the next reward.` }
         : base;
 
   return (
-    <section className="sec tagsec" id="card" ref={root} aria-labelledby="card-head">
+    <section className="scene tagsec" id="card" ref={root} aria-labelledby="card-head">
       <div className="wrap tagsec__grid">
         <div className="tagsec__ask">
-          <p className="fig">Specimen card</p>
+          <p className="kick">The cloakroom</p>
           <h2 className="h2" id="card-head">
-            Find your sloth
+            Find your skull.
           </h2>
           <form className="lookup" onSubmit={submit} noValidate>
             <label htmlFor="wallet">Wallet address</label>
@@ -489,9 +489,9 @@ export function Tag({ live }: { live: boolean }) {
                   <dd className="num">{eth(info.received)}</dd>
                 </div>
                 <div>
-                  <dt>{info.status === "sitting" && info.inTop ? "Next reward, est." : info.status === "hopped" ? "Let go" : "Rank"}</dt>
+                  <dt>{(info.status === "sitting" && info.inTop) || info.spark ? "Next reward, est." : info.status === "hopped" ? "Sold" : "Rank"}</dt>
                   <dd className="num">
-                    {info.status === "sitting" && info.inTop ? (
+                    {(info.status === "sitting" && info.inTop) || info.spark ? (
                       eth(info.estNext)
                     ) : info.status === "hopped" ? (
                       info.hoppedTx ? (
@@ -509,7 +509,10 @@ export function Tag({ live }: { live: boolean }) {
                   </dd>
                 </div>
               </dl>
-              <p className="tag__line">{stamp.line}</p>
+              <p className="tag__line">
+                {stamp.line}
+                {info.spark ? ` You bought ${compact(info.bought ?? "0")} since the last reward, more than anyone: yours are the biggest flowers unless someone buys more.` : ""}
+              </p>
               <button type="button" className="tag__share" onClick={share}>
                 {linked ? <Check weight="bold" aria-hidden="true" /> : <LinkSimple weight="bold" aria-hidden="true" />}
                 {linked ? "Link copied" : "Copy link"}
@@ -517,7 +520,7 @@ export function Tag({ live }: { live: boolean }) {
             </article>
           ) : (
             <div className="tag is-blank" aria-hidden="true">
-              <p className="tag__blank">Your specimen card appears here.</p>
+              <p className="tag__blank">Your card appears here.</p>
             </div>
           )}
           {info && info.status !== "not-holding" && (info.status !== "excluded" || info.house) ? (
@@ -526,8 +529,8 @@ export function Tag({ live }: { live: boolean }) {
             // Say why the room is shut instead of leaving a connected holder guessing.
             <p className="help">
               {live
-                ? `Names, sloths and X links are for wallets holding ${TICKER}. Buy in, then come back.`
-                : `Opens at launch: once ${TICKER} trades, any holder can set a name, dress their sloth or link X here.`}
+                ? `Names, skulls and X links are for wallets holding ${TICKER}. Buy in, then come back.`
+                : `Opens at launch: once ${TICKER} trades, any holder can set a name, dress their skull or link X here.`}
             </p>
           ) : null}
         </div>
